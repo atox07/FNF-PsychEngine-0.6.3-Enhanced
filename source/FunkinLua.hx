@@ -2303,6 +2303,9 @@ class FunkinLua {
 			return closed;
 		});
 
+		// Finestre extra di Windows (vedi WindowFunctions.hx / WinNative.hx)
+		WindowFunctions.implement(this);
+
 		Lua_helper.add_callback(lua, "changePresence", function(details:String, state:Null<String>, ?smallImageKey:String, ?hasStartTimestamp:Bool, ?endTimestamp:Float) {
 			#if desktop
 			DiscordClient.changePresence(details, state, smallImageKey, hasStartTimestamp, endTimestamp);
