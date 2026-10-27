@@ -72,8 +72,7 @@ class WindowFunctions
 			var bd = new BitmapData(2, 1, true, 0);
 			bd.setPixel32(0, 0, 0xFF112233);
 			bd.setPixel32(1, 0, 0x80FF8040);
-			var ba = new ByteArray();
-			bd.copyPixelsToByteArray(bd.rect, ba);
+			var ba:ByteArray = bd.getPixels(bd.rect);
 			var b:Array<Int> = [for (i in 0...8) ba[i]];
 			bd.dispose();
 
@@ -277,9 +276,7 @@ class WindowFunctions
 			catch (e:Dynamic) {}
 		}
 
-		var ba = d.buf;
-		ba.clear();
-		c.copyPixelsToByteArray(c.rect, ba);
+		var ba:ByteArray = c.getPixels(c.rect);
 		if (ba.length >= d.w * d.h * 4)
 		{
 			var bytes:Bytes = cast ba;
