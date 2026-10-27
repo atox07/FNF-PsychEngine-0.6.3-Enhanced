@@ -5000,6 +5000,8 @@ class PlayState extends MusicBeatState
 		}
 		luaArray = [];
 
+		WindowFunctions.closeAll(); // chiude le finestre extra aperte dai lua
+
 		#if hscript
 		if(FunkinLua.hscript != null) FunkinLua.hscript = null;
 		#end
