@@ -25,6 +25,67 @@ package;
 #endif
 #include <windows.h>
 #include <stdint.h>
+
+// WndProc delle finestre extra: non catturano MAI il mouse e non avviano
+// il loop modale di trascinamento/ridimensionamento (che bloccherebbe il gioco
+// e il cursore finche\' tieni premuto).
+static LRESULT CALLBACK PsychExtraProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+	switch (m)
+	{
+		case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+		case WM_SYSCOMMAND:
+		{
+			UINT c = (UINT)(w & 0xFFF0);
+			if (c == SC_MOVE || c == SC_SIZE || c == SC_KEYMENU) return 0;
+			break;
+		}
+		case WM_CAPTURECHANGED: break;
+	}
+	return DefWindowProcW(h, m, w, l);
+}
+
+// Cache dei buffer DIB per finestra: niente CreateDIBSection/DeleteObject a ogni frame.
+struct PsychBuf { HWND hwnd; int w; int h; HBITMAP bmp; void* bits; HDC dc; HGDIOBJ old; };
+static PsychBuf g_pb[32];
+static HDC g_screenDC = NULL;
+
+static void PsychFreeBuf(PsychBuf* b)
+{
+	if (b->dc) { if (b->old) SelectObject(b->dc, b->old); DeleteDC(b->dc); }
+	if (b->bmp) DeleteObject(b->bmp);
+	ZeroMemory(b, sizeof(PsychBuf));
+}
+
+static void PsychFreeBufFor(HWND hwnd)
+{
+	for (int i = 0; i < 32; i++) if (g_pb[i].hwnd == hwnd) PsychFreeBuf(&g_pb[i]);
+}
+
+static PsychBuf* PsychGetBuf(HWND hwnd, int w, int h, BITMAPINFO* bi)
+{
+	PsychBuf* slot = NULL;
+	for (int i = 0; i < 32; i++)
+	{
+		if (g_pb[i].hwnd == hwnd)
+		{
+			if (g_pb[i].w == w && g_pb[i].h == h && g_pb[i].bmp) return &g_pb[i];
+			PsychFreeBuf(&g_pb[i]);
+			slot = &g_pb[i];
+			break;
+		}
+		if (g_pb[i].hwnd == NULL && slot == NULL) slot = &g_pb[i];
+	}
+	if (slot == NULL) return NULL;
+	if (g_screenDC == NULL) g_screenDC = GetDC(NULL);
+	void* bits = NULL;
+	HBITMAP bmp = CreateDIBSection(g_screenDC, bi, DIB_RGB_COLORS, &bits, NULL, 0);
+	if (bmp == NULL || bits == NULL) { if (bmp) DeleteObject(bmp); return NULL; }
+	HDC dc = CreateCompatibleDC(g_screenDC);
+	HGDIOBJ old = SelectObject(dc, bmp);
+	slot->hwnd = hwnd; slot->w = w; slot->h = h; slot->bmp = bmp; slot->bits = bits; slot->dc = dc; slot->old = old;
+	return slot;
+}
 ')
 class WinNative
 {
@@ -36,7 +97,7 @@ class WinNative
 			WNDCLASSEXW wc;
 			ZeroMemory(&wc, sizeof(wc));
 			wc.cbSize = sizeof(WNDCLASSEXW);
-			wc.lpfnWndProc = DefWindowProcW;
+			wc.lpfnWndProc = PsychExtraProc;
 			wc.hInstance = inst;
 			wc.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
 			wc.lpszClassName = L"PsychLuaExtraWindow";
@@ -49,7 +110,7 @@ class WinNative
 		DWORD ex = WS_EX_NOACTIVATE;
 		if (noFrame) ex |= WS_EX_TOOLWINDOW;
 		if (topmost) ex |= WS_EX_TOPMOST;
-		if (layered) ex |= WS_EX_LAYERED;
+		if (layered) ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT; // click-through di default
 
 		RECT rc;
 		rc.left = x; rc.top = y; rc.right = x + w; rc.bottom = y + hgt;
@@ -68,6 +129,7 @@ class WinNative
 	}
 
 	@:functionCode('
+		PsychFreeBufFor((HWND)(intptr_t)hnd);
 		DestroyWindow((HWND)(intptr_t)hnd);
 	')
 	public static function destroyWin(hnd:Int):Void {}
@@ -87,7 +149,7 @@ class WinNative
 		ClientToScreen(hwnd, &p);
 		int offX = p.x - wr.left;
 		int offY = p.y - wr.top;
-		SetWindowPos(hwnd, NULL, x - offX, y - offY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+		SetWindowPos(hwnd, NULL, x - offX, y - offY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 	')
 	public static function setPos(hnd:Int, x:Int, y:Int):Void {}
 
@@ -187,8 +249,103 @@ class WinNative
 	}
 
 	/**
+	 * Sposta/ridimensiona la finestra VERA del gioco con UNA sola chiamata
+	 * (invece dei 4 set separati di Lime). x,y,w,h sono in coordinate dell'AREA CLIENT,
+	 * le stesse di application.window.x/y/width/height. w/h <= 0 = non cambiare dimensione.
+	 * Subito dopo rilascia cattura/gabbia del mouse che SDL puo' aver riapplicato.
+	 */
+	@:functionCode('
+		static HWND game = NULL;
+		if (game == NULL || !IsWindow(game))
+		{
+			game = NULL;
+			HWND cur = NULL;
+			DWORD pid = GetCurrentProcessId();
+			while ((cur = FindWindowExW(NULL, cur, L"SDL_app", NULL)) != NULL)
+			{
+				DWORD wp = 0;
+				GetWindowThreadProcessId(cur, &wp);
+				if (wp == pid) { game = cur; break; }
+			}
+			if (game == NULL) return;
+		}
+		bool keepSize = (w <= 0 || hgt <= 0);
+		int cw = w, ch = hgt;
+		if (keepSize)
+		{
+			RECT c; GetClientRect(game, &c);
+			cw = c.right; ch = c.bottom;
+		}
+		DWORD style = (DWORD)GetWindowLongPtrW(game, GWL_STYLE);
+		DWORD ex = (DWORD)GetWindowLongPtrW(game, GWL_EXSTYLE);
+		RECT rc; rc.left = x; rc.top = y; rc.right = x + cw; rc.bottom = y + ch;
+		AdjustWindowRectEx(&rc, style, FALSE, ex);
+		UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+		if (keepSize) flags |= SWP_NOSIZE;
+		SetWindowPos(game, NULL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, flags);
+		if (GetCapture() != NULL) ReleaseCapture();
+		ClipCursor(NULL);
+	')
+	public static function setGameRect(x:Int, y:Int, w:Int, hgt:Int):Void {}
+
+	/** Libera il mouse (cattura + gabbia). Utile da chiamare ogni tanto come rete di sicurezza. */
+	@:functionCode('
+		if (GetCapture() != NULL) ReleaseCapture();
+		ClipCursor(NULL);
+	')
+	public static function releaseMouse():Void {}
+
+	/**
+	 * Guardia del mouse, da chiamare ogni frame. Toglie:
+	 *  - una cattura (SetCapture) rimasta appesa con nessun tasto premuto
+	 *  - una gabbia (ClipCursor) piu' piccola dello schermo
+	 * Ritorna una maschera: 1 = cattura rilasciata, 2 = gabbia rilasciata.
+	 */
+	@:functionCode('
+		int mask = 0;
+		bool down = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) || ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) || ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
+		if (GetCapture() != NULL && !down) { ReleaseCapture(); mask |= 1; }
+		RECT cr;
+		if (GetClipCursor(&cr))
+		{
+			int vl = GetSystemMetrics(SM_XVIRTUALSCREEN);
+			int vt = GetSystemMetrics(SM_YVIRTUALSCREEN);
+			int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+			int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+			if (cr.left > vl || cr.top > vt || cr.right < vl + vw || cr.bottom < vt + vh) { ClipCursor(NULL); mask |= 2; }
+		}
+		return mask;
+	')
+	public static function freeMouse():Int
+	{
+		return 0;
+	}
+
+	/** Solo diagnostica (non modifica nulla): 1 = cattura attiva, 2 = gabbia attiva, 4 = tasto premuto. */
+	@:functionCode('
+		int mask = 0;
+		if (GetCapture() != NULL) mask |= 1;
+		RECT cr;
+		if (GetClipCursor(&cr))
+		{
+			int vl = GetSystemMetrics(SM_XVIRTUALSCREEN);
+			int vt = GetSystemMetrics(SM_YVIRTUALSCREEN);
+			int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+			int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+			if (cr.left > vl || cr.top > vt || cr.right < vl + vw || cr.bottom < vt + vh) mask |= 2;
+		}
+		if (((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) || ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0)) mask |= 4;
+		return mask;
+	')
+	public static function mouseState():Int
+	{
+		return 0;
+	}
+
+	/**
 	 * Disegna il buffer (4 byte per pixel, ordine canali dato da iA/iR/iG/iB)
 	 * nella finestra. Se layered -> trasparenza per pixel.
+	 * Usa un DIB in cache per finestra e un ciclo veloce per l'ordine ARGB piu' comune.
 	 */
 	@:functionCode('
 		HWND hwnd = (HWND)(intptr_t)hnd;
@@ -205,14 +362,33 @@ class WinNative
 		bi.bmiHeader.biBitCount = 32;
 		bi.bmiHeader.biCompression = BI_RGB;
 
-		HDC screenDC = GetDC(NULL);
-		void* bits = NULL;
-		HBITMAP bmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+		PsychBuf* pb = PsychGetBuf(hwnd, w, hgt, &bi);
+		if (pb == NULL) return;
+		if (g_screenDC == NULL) g_screenDC = GetDC(NULL);
 
-		if (bmp != NULL && bits != NULL)
+		unsigned char* dst = (unsigned char*)pb->bits;
+		int n = w * hgt;
+
+		if (layered && !srcPremult && iA == 0 && iR == 1 && iG == 2 && iB == 3)
 		{
-			unsigned char* dst = (unsigned char*)bits;
-			int n = w * hgt;
+			for (int i = 0; i < n; i++)
+			{
+				const unsigned char* s = src + i * 4;
+				unsigned char* d = dst + i * 4;
+				unsigned int a = s[0];
+				if (a == 255) { d[0] = s[3]; d[1] = s[2]; d[2] = s[1]; d[3] = 255; }
+				else if (a == 0) { d[0] = 0; d[1] = 0; d[2] = 0; d[3] = 0; }
+				else
+				{
+					d[0] = (unsigned char)((s[3] * a + 127) / 255);
+					d[1] = (unsigned char)((s[2] * a + 127) / 255);
+					d[2] = (unsigned char)((s[1] * a + 127) / 255);
+					d[3] = (unsigned char)a;
+				}
+			}
+		}
+		else
+		{
 			for (int i = 0; i < n; i++)
 			{
 				const unsigned char* s = src + i * 4;
@@ -229,46 +405,33 @@ class WinNative
 						g = (g * a + 127) / 255;
 						b = (b * a + 127) / 255;
 					}
-					d[0] = (unsigned char)b;
-					d[1] = (unsigned char)g;
-					d[2] = (unsigned char)r;
-					d[3] = (unsigned char)a;
+					d[0] = (unsigned char)b; d[1] = (unsigned char)g; d[2] = (unsigned char)r; d[3] = (unsigned char)a;
 				}
 				else
 				{
-					d[0] = (unsigned char)b;
-					d[1] = (unsigned char)g;
-					d[2] = (unsigned char)r;
-					d[3] = 255;
+					d[0] = (unsigned char)b; d[1] = (unsigned char)g; d[2] = (unsigned char)r; d[3] = 255;
 				}
-			}
-
-			if (layered)
-			{
-				HDC memDC = CreateCompatibleDC(screenDC);
-				HGDIOBJ oldObj = SelectObject(memDC, bmp);
-				SIZE sz; sz.cx = w; sz.cy = hgt;
-				POINT zero; zero.x = 0; zero.y = 0;
-				BLENDFUNCTION bf;
-				bf.BlendOp = AC_SRC_OVER;
-				bf.BlendFlags = 0;
-				bf.SourceConstantAlpha = 255;
-				bf.AlphaFormat = AC_SRC_ALPHA;
-				UpdateLayeredWindow(hwnd, screenDC, NULL, &sz, memDC, &zero, 0, &bf, ULW_ALPHA);
-				SelectObject(memDC, oldObj);
-				DeleteDC(memDC);
-			}
-			else
-			{
-				HDC wdc = GetDC(hwnd);
-				RECT cr; GetClientRect(hwnd, &cr);
-				StretchDIBits(wdc, 0, 0, cr.right, cr.bottom, 0, 0, w, hgt, bits, &bi, DIB_RGB_COLORS, SRCCOPY);
-				ReleaseDC(hwnd, wdc);
 			}
 		}
 
-		if (bmp != NULL) DeleteObject(bmp);
-		ReleaseDC(NULL, screenDC);
+		if (layered)
+		{
+			SIZE sz; sz.cx = w; sz.cy = hgt;
+			POINT zero; zero.x = 0; zero.y = 0;
+			BLENDFUNCTION bf;
+			bf.BlendOp = AC_SRC_OVER;
+			bf.BlendFlags = 0;
+			bf.SourceConstantAlpha = 255;
+			bf.AlphaFormat = AC_SRC_ALPHA;
+			UpdateLayeredWindow(hwnd, g_screenDC, NULL, &sz, pb->dc, &zero, 0, &bf, ULW_ALPHA);
+		}
+		else
+		{
+			HDC wdc = GetDC(hwnd);
+			RECT cr; GetClientRect(hwnd, &cr);
+			StretchDIBits(wdc, 0, 0, cr.right, cr.bottom, 0, 0, w, hgt, pb->bits, &bi, DIB_RGB_COLORS, SRCCOPY);
+			ReleaseDC(hwnd, wdc);
+		}
 	')
 	public static function present(hnd:Int, data:haxe.io.BytesData, w:Int, hgt:Int, layered:Bool, iA:Int, iR:Int, iG:Int, iB:Int, srcPremult:Bool):Void {}
 }
