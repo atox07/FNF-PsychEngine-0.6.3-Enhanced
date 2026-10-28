@@ -404,10 +404,9 @@ class WindowFunctions
 			catch (e:Dynamic) {}
 		}
 
-		// buffer riusato (prima: getPixels() allocava ~3.7 MB nuovi a ogni frame -> GC -> lag)
-		var ba:ByteArray = d.buf;
-		ba.position = 0;
-		c.copyPixelsToByteArray(c.rect, ba);
+		// getPixels() esiste in tutte le versioni di OpenFL (copyPixelsToByteArray no).
+		// Ora viene chiamato solo quando la finestra va davvero ridisegnata.
+		var ba:ByteArray = c.getPixels(c.rect);
 		if (ba.length >= d.w * d.h * 4)
 		{
 			var bytes:Bytes = cast ba;
