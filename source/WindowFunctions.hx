@@ -2,6 +2,7 @@ package;
 
 import flixel.FlxG;
 import flixel.FlxSprite;
+import flixel.graphics.frames.FlxFrame;
 import flixel.util.FlxColor;
 import haxe.io.Bytes;
 import lime.app.Application;
@@ -21,6 +22,20 @@ typedef WinItem =
 	var fixed:Bool; // true = posizione fissa nella finestra (fx, fy); false = posizione "mondo" (spr.x - viewX)
 	var fx:Float;
 	var fy:Float;
+	// cache dell'ultimo stato disegnato (per ridisegnare solo se cambia qualcosa)
+	var cFrame:FlxFrame;
+	var cPx:Float;
+	var cPy:Float;
+	var cSx:Float;
+	var cSy:Float;
+	var cAng:Float;
+	var cOx:Float;
+	var cOy:Float;
+	var cAlpha:Float;
+	var cColor:Int;
+	var cFlipX:Bool;
+	var cFlipY:Bool;
+	var cAA:Bool;
 }
 
 typedef WinData =
@@ -38,6 +53,14 @@ typedef WinData =
 	var canvas:BitmapData;
 	var buf:ByteArray;
 	var items:Array<WinItem>;
+	var dirty:Bool; // forza il prossimo ridisegno
+	var idle:Int; // frame passati senza cambiamenti
+	var lvx:Float;
+	var lvy:Float;
+	var lbg:Int;
+	var lw:Int;
+	var lh:Int;
+	var lcount:Int;
 }
 
 /**
@@ -50,6 +73,14 @@ class WindowFunctions
 	public static var windows:Map<String, WinData> = new Map<String, WinData>();
 
 	static var hooked:Bool = false;
+
+	// Guardia del mouse: ogni frame toglie SetCapture appesi / ClipCursor che trascinano il cursore
+	static var mouseGuard:Bool = true;
+	static var guardWarned:Int = 0;
+
+	static var mtx:Matrix = new Matrix();
+
+	static inline var FORCE_REDRAW_EVERY:Int = 30; // ridisegno di sicurezza se nulla cambia
 
 	// Ordine dei canali restituito da BitmapData.copyPixelsToByteArray (calibrato a runtime)
 	static var iA:Int = 0;
@@ -180,11 +211,19 @@ class WindowFunctions
 			viewY: 0,
 			canvas: new BitmapData(iw, ih, true, 0),
 			buf: new ByteArray(),
-			items: []
+			items: [],
+			dirty: true,
+			idle: 0,
+			lvx: 0,
+			lvy: 0,
+			lbg: 0,
+			lw: 0,
+			lh: 0,
+			lcount: -1
 		};
 		windows.set(tag, d);
 		hook();
-		render(d);
+		render(d, true);
 		return true;
 		#else
 		return false;
@@ -214,6 +253,16 @@ class WindowFunctions
 	public static function update():Void
 	{
 		#if windows
+		if (mouseGuard)
+		{
+			var r = WinNative.freeMouse();
+			if (r != 0 && guardWarned < 3)
+			{
+				guardWarned++;
+				trace('WindowFunctions: mouse liberato (' + ((r & 1) != 0 ? 'cattura ' : '') + ((r & 2) != 0 ? 'gabbia-cursore' : '') + ')');
+			}
+		}
+
 		var dead:Array<String> = null;
 		for (tag => d in windows)
 		{
@@ -240,9 +289,88 @@ class WindowFunctions
 		#end
 	}
 
-	static function render(d:WinData):Void
+	static function newItem(tag:String, spr:FlxSprite, fixed:Bool, fx:Float, fy:Float):WinItem
+	{
+		return {
+			tag: tag,
+			spr: spr,
+			fixed: fixed,
+			fx: fx,
+			fy: fy,
+			cFrame: null,
+			cPx: -99999,
+			cPy: -99999,
+			cSx: 0,
+			cSy: 0,
+			cAng: 0,
+			cOx: 0,
+			cOy: 0,
+			cAlpha: -1,
+			cColor: 0,
+			cFlipX: false,
+			cFlipY: false,
+			cAA: false
+		};
+	}
+
+	/** Confronta lo stato attuale dello sprite con l'ultimo disegnato e aggiorna la cache. */
+	static function itemChanged(it:WinItem, spr:FlxSprite, px:Float, py:Float):Bool
+	{
+		var ch = false;
+		var col:Int = spr.color;
+		if (it.cFrame != spr.frame) { it.cFrame = spr.frame; ch = true; }
+		if (it.cPx != px) { it.cPx = px; ch = true; }
+		if (it.cPy != py) { it.cPy = py; ch = true; }
+		if (it.cSx != spr.scale.x) { it.cSx = spr.scale.x; ch = true; }
+		if (it.cSy != spr.scale.y) { it.cSy = spr.scale.y; ch = true; }
+		if (it.cAng != spr.angle) { it.cAng = spr.angle; ch = true; }
+		if (it.cOx != spr.origin.x) { it.cOx = spr.origin.x; ch = true; }
+		if (it.cOy != spr.origin.y) { it.cOy = spr.origin.y; ch = true; }
+		if (it.cAlpha != spr.alpha) { it.cAlpha = spr.alpha; ch = true; }
+		if (it.cColor != col) { it.cColor = col; ch = true; }
+		if (it.cFlipX != spr.flipX) { it.cFlipX = spr.flipX; ch = true; }
+		if (it.cFlipY != spr.flipY) { it.cFlipY = spr.flipY; ch = true; }
+		if (it.cAA != spr.antialiasing) { it.cAA = spr.antialiasing; ch = true; }
+		return ch;
+	}
+
+	/**
+	 * Ridisegna la finestra SOLO se qualcosa e' cambiato (sprite mosso, nuovo frame
+	 * d'animazione, scala, colore...). Se e' tutto fermo non fa nulla: niente
+	 * conversione pixel, niente UpdateLayeredWindow. Spostare la finestra
+	 * (setWindowPos) non richiede nessun ridisegno.
+	 */
+	static function render(d:WinData, force:Bool = false):Void
 	{
 		#if windows
+		var changed = force || d.dirty || d.viewX != d.lvx || d.viewY != d.lvy || d.bg != d.lbg || d.w != d.lw || d.h != d.lh;
+
+		var count = 0;
+		for (it in d.items)
+		{
+			var spr = it.spr;
+			if (spr == null || !spr.exists || spr.frame == null) continue;
+			count++;
+			var px:Float = (it.fixed ? it.fx : (spr.x - d.viewX)) - spr.offset.x;
+			var py:Float = (it.fixed ? it.fy : (spr.y - d.viewY)) - spr.offset.y;
+			if (itemChanged(it, spr, px, py)) changed = true;
+		}
+		if (count != d.lcount) changed = true;
+
+		if (!changed)
+		{
+			d.idle++;
+			if (d.idle < FORCE_REDRAW_EVERY) return;
+		}
+		d.idle = 0;
+		d.dirty = false;
+		d.lvx = d.viewX;
+		d.lvy = d.viewY;
+		d.lbg = d.bg;
+		d.lw = d.w;
+		d.lh = d.h;
+		d.lcount = count;
+
 		var c = d.canvas;
 		c.fillRect(c.rect, d.bg);
 
@@ -263,20 +391,23 @@ class WindowFunctions
 			var px:Float = (it.fixed ? it.fx : (spr.x - d.viewX)) - spr.offset.x;
 			var py:Float = (it.fixed ? it.fy : (spr.y - d.viewY)) - spr.offset.y;
 
-			var m = new Matrix();
-			m.translate(-spr.origin.x, -spr.origin.y);
-			m.scale(spr.scale.x, spr.scale.y);
-			if (spr.angle != 0) m.rotate(spr.angle * Math.PI / 180);
-			m.translate(spr.origin.x + px, spr.origin.y + py);
+			mtx.identity();
+			mtx.translate(-spr.origin.x, -spr.origin.y);
+			mtx.scale(spr.scale.x, spr.scale.y);
+			if (spr.angle != 0) mtx.rotate(spr.angle * Math.PI / 180);
+			mtx.translate(spr.origin.x + px, spr.origin.y + py);
 
 			try
 			{
-				c.draw(src, m, null, null, null, spr.antialiasing);
+				c.draw(src, mtx, null, null, null, spr.antialiasing);
 			}
 			catch (e:Dynamic) {}
 		}
 
-		var ba:ByteArray = c.getPixels(c.rect);
+		// buffer riusato (prima: getPixels() allocava ~3.7 MB nuovi a ogni frame -> GC -> lag)
+		var ba:ByteArray = d.buf;
+		ba.position = 0;
+		c.copyPixelsToByteArray(c.rect, ba);
 		if (ba.length >= d.w * d.h * 4)
 		{
 			var bytes:Bytes = cast ba;
@@ -293,6 +424,9 @@ class WindowFunctions
 	{
 		#if LUA_ALLOWED
 		var lua = funk.lua;
+		#if windows
+		hook(); // la guardia del mouse deve girare anche senza finestre extra
+		#end
 
 		#if !windows
 		Lua_helper.add_callback(lua, "createWindow", function(tag:String, title:String, x:Float, y:Float, w:Float, h:Float, ?borderless:Bool = false, ?transparent:Bool = false) {
@@ -349,6 +483,7 @@ class WindowFunctions
 			d.h = ih;
 			if (d.canvas != null) d.canvas.dispose();
 			d.canvas = new BitmapData(iw, ih, true, 0);
+			d.dirty = true;
 			WinNative.setSize(d.handle, iw, ih);
 			return true;
 		});
@@ -416,7 +551,7 @@ class WindowFunctions
 				}
 				if ((d.bg >>> 24) == 0) d.bg = 0xFF000000;
 			}
-			render(d);
+			render(d, true);
 			return true;
 		});
 
@@ -438,7 +573,7 @@ class WindowFunctions
 			}
 			d.clickThrough = on;
 			WinNative.setClickThrough(d.handle, on);
-			render(d);
+			render(d, true);
 			return true;
 		});
 
@@ -477,16 +612,12 @@ class WindowFunctions
 					it.fixed = (x != null);
 					if (x != null) it.fx = x;
 					if (y != null) it.fy = y;
+					d.dirty = true;
 					return true;
 				}
 			}
-			d.items.push({
-				tag: spriteTag,
-				spr: spr,
-				fixed: (x != null),
-				fx: (x != null) ? x : 0,
-				fy: (y != null) ? y : 0
-			});
+			d.items.push(newItem(spriteTag, spr, (x != null), (x != null) ? x : 0, (y != null) ? y : 0));
+			d.dirty = true;
 			return true;
 		});
 
@@ -498,6 +629,7 @@ class WindowFunctions
 				if (it.tag == spriteTag)
 				{
 					d.items.remove(it);
+					d.dirty = true;
 					return true;
 				}
 			}
@@ -531,6 +663,39 @@ class WindowFunctions
 		});
 
 		// ---------- schermo / finestra di gioco ----------
+
+		// Sposta/ridimensiona la finestra VERA del gioco con UNA chiamata (coordinate come window.x/y/width/height).
+		// w/h = 0 -> solo spostamento. Sostituisce i 4 setPropertyFromClass(...application.window...) per frame.
+		Lua_helper.add_callback(lua, "setGameWindowRect", function(x:Float, y:Float, ?w:Float = 0, ?h:Float = 0) {
+			if (Application.current.window.fullscreen) return false;
+			WinNative.setGameRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+			return true;
+		});
+
+		// Rete di sicurezza: libera cattura/gabbia del mouse subito
+		Lua_helper.add_callback(lua, "releaseMouse", function() {
+			WinNative.freeMouse();
+		});
+
+		// Accende/spegne la guardia automatica del mouse (default: accesa)
+		Lua_helper.add_callback(lua, "setMouseGuard", function(on:Bool) {
+			mouseGuard = on;
+		});
+
+		// Diagnostica: stampa se il mouse e' catturato (1) / ingabbiato (2) / tasto premuto (4)
+		Lua_helper.add_callback(lua, "debugMouse", function() {
+			var m = WinNative.mouseState();
+			funk.luaTrace('debugMouse: catturato=' + ((m & 1) != 0) + ' ingabbiato=' + ((m & 2) != 0) + ' tasto=' + ((m & 4) != 0), false, false, FlxColor.YELLOW);
+			return m;
+		});
+
+		// Forza il ridisegno di una finestra (es. se hai ridisegnato i pixel di uno sprite a mano)
+		Lua_helper.add_callback(lua, "redrawWindow", function(tag:String) {
+			var d = windows.get(tag);
+			if (d == null) return false;
+			d.dirty = true;
+			return true;
+		});
 
 		Lua_helper.add_callback(lua, "getScreenWidth", function() {
 			return WinNative.screenWidth();
